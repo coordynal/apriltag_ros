@@ -271,6 +271,30 @@ void AprilTagNode::onCamera(const sensor_msgs::msg::Image::ConstSharedPtr& msg_i
         // reject detections with more corrected bits than allowed
         if(det->hamming > max_hamming) { continue; }
 
+        // Define a safety margin in pixels from the image boundary
+        const double edge_margin = 50.0; 
+        
+        // Get image dimensions from the incoming image properties
+        const double img_width = img_uint8.cols;
+        const double img_height = img_uint8.rows;
+
+        bool near_edge = false;
+        for(int corner_idx = 0; corner_idx < 4; corner_idx++) {
+            double cx = det->p[corner_idx][0];
+            double cy = det->p[corner_idx][1];
+
+            if(cx < edge_margin || cx > (img_width - edge_margin) ||
+            cy < edge_margin || cy > (img_height - edge_margin)) {
+                near_edge = true;
+                break;
+            }
+        }
+
+        if(near_edge) {
+            RCLCPP_DEBUG(get_logger(), "Rejecting tag %d due to edge proximity.", det->id);
+            continue; 
+        }
+
         // For all detections, extract relevant ones to bundle_detections
         if(tag_id_to_bundles.count(det->id)) {
             for(const TagBundlePtr& bundle : tag_id_to_bundles[det->id]) {
