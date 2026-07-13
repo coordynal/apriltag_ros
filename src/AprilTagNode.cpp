@@ -1,4 +1,5 @@
 // ros
+#include <cmath>
 #include "pose_estimation.hpp"
 #include <apriltag_msgs/msg/april_tag_detection.hpp>
 #include <apriltag_msgs/msg/april_tag_detection_array.hpp>
@@ -89,6 +90,7 @@ private:
     double tag_edge_size;
     std::atomic<int> max_hamming;
     std::atomic<bool> profile;
+    std::atomic<double> max_tag_distance;
     TagBundleVec all_tag_bundles;
     std::unordered_map<int64_t, TagBundleVec> tag_id_to_bundles;
     std::unordered_map<int, std::string> tag_frames;
@@ -179,6 +181,8 @@ AprilTagNode::AprilTagNode(const rclcpp::NodeOptions& options)
 
     declare_parameter("max_hamming", 0, descr("reject detections with more corrected bits than allowed"));
     declare_parameter("profile", false, descr("print profiling information to stdout"));
+    max_tag_distance = declare_parameter("max_tag_distance", 3.0,
+        descr("maximum estimated distance (meters) from the camera for a tag to be included in tag bundle pose estimation; <= 0 disables this filter"));
 
     for(const std::string& bundle_name : bundle_names) {
         TagBundlePtr bundle = std::make_shared<TagBundle>();
@@ -297,8 +301,28 @@ void AprilTagNode::onCamera(const sensor_msgs::msg::Image::ConstSharedPtr& msg_i
 
         // For all detections, extract relevant ones to bundle_detections
         if(tag_id_to_bundles.count(det->id)) {
-            for(const TagBundlePtr& bundle : tag_id_to_bundles[det->id]) {
-                bundle_detections[bundle->frame_id].push_back(det);
+            bool include_in_bundle = true;
+
+            // Reject tags that are too far from the camera to be reliable bundle correspondences
+            const double max_dist = max_tag_distance;
+            if(max_dist > 0.0 && estimate_pose != nullptr && calibrated) {
+                const double size = tag_sizes.count(det->id) ? tag_sizes.at(det->id) : tag_edge_size;
+                const geometry_msgs::msg::Transform tag_transform = estimate_pose(det, intrinsics, size);
+                const double distance = std::sqrt(
+                    tag_transform.translation.x * tag_transform.translation.x +
+                    tag_transform.translation.y * tag_transform.translation.y +
+                    tag_transform.translation.z * tag_transform.translation.z);
+
+                if(distance > max_dist) {
+                    include_in_bundle = false;
+                    RCLCPP_DEBUG(get_logger(), "Excluding tag %d from bundle: estimated distance %.2fm exceeds max_tag_distance %.2fm", det->id, distance, max_dist);
+                }
+            }
+
+            if(include_in_bundle) {
+                for(const TagBundlePtr& bundle : tag_id_to_bundles[det->id]) {
+                    bundle_detections[bundle->frame_id].push_back(det);
+                }
             }
         }
 
@@ -368,6 +392,7 @@ AprilTagNode::onParameter(const std::vector<rclcpp::Parameter>& parameters)
         IF("detector.debug", td->debug)
         IF("max_hamming", max_hamming)
         IF("profile", profile)
+        IF("max_tag_distance", max_tag_distance)
     }
 
     mutex.unlock();
