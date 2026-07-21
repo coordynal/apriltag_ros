@@ -1,8 +1,9 @@
 // ros
-#include <cmath>
 #include "pose_estimation.hpp"
 #include <apriltag_msgs/msg/april_tag_detection.hpp>
 #include <apriltag_msgs/msg/april_tag_detection_array.hpp>
+#include <cmath>
+#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #ifdef cv_bridge_HPP
 #include <cv_bridge/cv_bridge.hpp>
 #else
@@ -68,6 +69,7 @@ struct TagBundle
     std::unordered_map<int, double> id_to_size;
     std::unordered_map<int, std::vector<double>> id_to_tf;
     std::string frame_id;
+    rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pose_publisher;
 };
 
 class AprilTagNode : public rclcpp::Node {
@@ -91,6 +93,9 @@ private:
     std::atomic<int> max_hamming;
     std::atomic<bool> profile;
     std::atomic<double> max_tag_distance;
+    std::atomic<double> covariance_pixel_stddev;
+    std::atomic<double> covariance_scale;
+    std::atomic<double> covariance_max_condition_number;
     TagBundleVec all_tag_bundles;
     std::unordered_map<int64_t, TagBundleVec> tag_id_to_bundles;
     std::unordered_map<int, std::string> tag_frames;
@@ -182,12 +187,26 @@ AprilTagNode::AprilTagNode(const rclcpp::NodeOptions& options)
     declare_parameter("max_hamming", 0, descr("reject detections with more corrected bits than allowed"));
     declare_parameter("profile", false, descr("print profiling information to stdout"));
     max_tag_distance = declare_parameter("max_tag_distance", 3.0,
-        descr("maximum estimated distance (meters) from the camera for a tag to be included in tag bundle pose estimation; <= 0 disables this filter"));
+                                         descr("maximum estimated distance (meters) from the camera for a tag to be included in tag bundle pose estimation; <= 0 disables this filter"));
+    covariance_pixel_stddev = declare_parameter(
+        "covariance.pixel_stddev", 0.75,
+        descr("minimum AprilTag corner standard deviation in pixels used by PnP covariance"));
+    covariance_scale = declare_parameter(
+        "covariance.scale", 1.0,
+        descr("empirical multiplier applied to PnP covariance"));
+    covariance_max_condition_number = declare_parameter(
+        "covariance.max_condition_number", 1.0e12,
+        descr("reject covariance output when the PnP information matrix is more ill-conditioned than this"));
+    const std::string bundle_pose_topic_prefix = declare_parameter(
+        "bundle_pose_topic_prefix", "bundle_poses",
+        descr("topic prefix for bundle PoseWithCovarianceStamped measurements", true));
 
     for(const std::string& bundle_name : bundle_names) {
         TagBundlePtr bundle = std::make_shared<TagBundle>();
 
         bundle->frame_id = bundle_name;
+        bundle->pose_publisher = create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
+            bundle_pose_topic_prefix + "/" + bundle_name, rclcpp::QoS(1));
         std::vector<int64_t> bundle_ids_vector = declare_parameter("tag_bundles." + bundle_name + ".ids", std::vector<int64_t>{}, descr("bundle ids", true));
         bundle->ids = std::set<int64_t>(bundle_ids_vector.begin(), bundle_ids_vector.end());
         for(const int64_t& id : bundle->ids) {
@@ -276,8 +295,8 @@ void AprilTagNode::onCamera(const sensor_msgs::msg::Image::ConstSharedPtr& msg_i
         if(det->hamming > max_hamming) { continue; }
 
         // Define a safety margin in pixels from the image boundary
-        const double edge_margin = 50.0; 
-        
+        const double edge_margin = 50.0;
+
         // Get image dimensions from the incoming image properties
         const double img_width = img_uint8.cols;
         const double img_height = img_uint8.rows;
@@ -288,7 +307,7 @@ void AprilTagNode::onCamera(const sensor_msgs::msg::Image::ConstSharedPtr& msg_i
             double cy = det->p[corner_idx][1];
 
             if(cx < edge_margin || cx > (img_width - edge_margin) ||
-            cy < edge_margin || cy > (img_height - edge_margin)) {
+               cy < edge_margin || cy > (img_height - edge_margin)) {
                 near_edge = true;
                 break;
             }
@@ -296,7 +315,7 @@ void AprilTagNode::onCamera(const sensor_msgs::msg::Image::ConstSharedPtr& msg_i
 
         if(near_edge) {
             RCLCPP_DEBUG(get_logger(), "Rejecting tag %d due to edge proximity.", det->id);
-            continue; 
+            continue;
         }
 
         // For all detections, extract relevant ones to bundle_detections
@@ -360,12 +379,37 @@ void AprilTagNode::onCamera(const sensor_msgs::msg::Image::ConstSharedPtr& msg_i
 
     if(estimate_pose != nullptr) {
         for(auto& bundle : all_tag_bundles) {
-            geometry_msgs::msg::TransformStamped bundle_transform_stamped;
             if(bundle_detections.count(bundle->frame_id)) {
+                const PoseEstimate estimate = pnp_bundle(
+                    bundle_detections[bundle->frame_id], intrinsics, bundle->id_to_size,
+                    bundle->id_to_tf, covariance_pixel_stddev, covariance_scale,
+                    covariance_max_condition_number);
+                if(!estimate.valid) {
+                    RCLCPP_DEBUG(get_logger(), "PnP failed for bundle %s", bundle->frame_id.c_str());
+                    continue;
+                }
+
+                geometry_msgs::msg::TransformStamped bundle_transform_stamped;
                 bundle_transform_stamped.header = msg_img->header;
                 bundle_transform_stamped.child_frame_id = bundle->frame_id;
-                bundle_transform_stamped.transform = pnp_bundle(bundle_detections[bundle->frame_id], intrinsics, bundle->id_to_size, bundle->id_to_tf);
+                bundle_transform_stamped.transform = estimate.transform;
                 tf_broadcaster.sendTransform(bundle_transform_stamped);
+
+                if(estimate.covariance_valid) {
+                    geometry_msgs::msg::PoseWithCovarianceStamped pose;
+                    pose.header = msg_img->header;
+                    pose.pose.pose.position.x = estimate.transform.translation.x;
+                    pose.pose.pose.position.y = estimate.transform.translation.y;
+                    pose.pose.pose.position.z = estimate.transform.translation.z;
+                    pose.pose.pose.orientation = estimate.transform.rotation;
+                    pose.pose.covariance = estimate.covariance;
+                    bundle->pose_publisher->publish(pose);
+                }
+                else {
+                    RCLCPP_DEBUG(
+                        get_logger(), "Covariance rejected for ill-conditioned bundle %s",
+                        bundle->frame_id.c_str());
+                }
             }
         }
         tf_broadcaster.sendTransform(tfs);
@@ -393,6 +437,9 @@ AprilTagNode::onParameter(const std::vector<rclcpp::Parameter>& parameters)
         IF("max_hamming", max_hamming)
         IF("profile", profile)
         IF("max_tag_distance", max_tag_distance)
+        IF("covariance.pixel_stddev", covariance_pixel_stddev)
+        IF("covariance.scale", covariance_scale)
+        IF("covariance.max_condition_number", covariance_max_condition_number)
     }
 
     mutex.unlock();
