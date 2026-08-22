@@ -150,6 +150,7 @@ install(DIRECTORY launch
 if(BUILD_TESTING)
   set(ament_cmake_clang_format_CONFIG_FILE "${CMAKE_SOURCE_DIR}/.clang-format")
   find_package(ament_lint_auto REQUIRED)
+  find_package(ament_cmake_gtest REQUIRED)
   # the following line skips the linter which checks for copyrights
   # comment the line when a copyright and license is added to all source files
   set(ament_cmake_copyright_FOUND TRUE)
@@ -158,6 +159,13 @@ if(BUILD_TESTING)
   # a copyright and license is added to all source files
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
+
+  ament_add_gtest(test_pose_estimation test/test_pose_estimation.cpp)
+  target_include_directories(test_pose_estimation PRIVATE src)
+  target_link_libraries(test_pose_estimation
+    pose_estimation
+    opencv_calib3d
+  )
 endif()
 
 ament_package()

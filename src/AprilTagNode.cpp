@@ -96,6 +96,8 @@ private:
     std::atomic<double> covariance_pixel_stddev;
     std::atomic<double> covariance_scale;
     std::atomic<double> covariance_max_condition_number;
+    std::atomic<double> max_reprojection_error;
+    std::atomic<double> max_tag_reprojection_error;
     TagBundleVec all_tag_bundles;
     std::unordered_map<int64_t, TagBundleVec> tag_id_to_bundles;
     std::unordered_map<int, std::string> tag_frames;
@@ -197,6 +199,12 @@ AprilTagNode::AprilTagNode(const rclcpp::NodeOptions& options)
     covariance_max_condition_number = declare_parameter(
         "covariance.max_condition_number", 1.0e12,
         descr("reject covariance output when the PnP information matrix is more ill-conditioned than this"));
+    max_reprojection_error = declare_parameter(
+        "max_reprojection_error", 3.0,
+        descr("reject bundle poses whose corner RMS reprojection error exceeds this many pixels; <= 0 disables"));
+    max_tag_reprojection_error = declare_parameter(
+        "max_tag_reprojection_error", 3.0,
+        descr("retry bundle PnP once without the worst tag when its corner RMS reprojection error exceeds this many pixels; <= 0 disables"));
     const std::string bundle_pose_topic_prefix = declare_parameter(
         "bundle_pose_topic_prefix", "bundle_poses",
         descr("topic prefix for bundle PoseWithCovarianceStamped measurements", true));
@@ -383,10 +391,20 @@ void AprilTagNode::onCamera(const sensor_msgs::msg::Image::ConstSharedPtr& msg_i
                 const PoseEstimate estimate = pnp_bundle(
                     bundle_detections[bundle->frame_id], intrinsics, bundle->id_to_size,
                     bundle->id_to_tf, covariance_pixel_stddev, covariance_scale,
-                    covariance_max_condition_number);
+                    covariance_max_condition_number, max_reprojection_error,
+                    max_tag_reprojection_error);
                 if(!estimate.valid) {
-                    RCLCPP_DEBUG(get_logger(), "PnP failed for bundle %s", bundle->frame_id.c_str());
+                    RCLCPP_DEBUG(
+                        get_logger(), "PnP failed or rejected for bundle %s (RMS %.2f px)",
+                        bundle->frame_id.c_str(), estimate.reprojection_error);
                     continue;
+                }
+
+                if(estimate.rejected_tag_id >= 0) {
+                    RCLCPP_DEBUG(
+                        get_logger(), "Bundle %s excluded tag %d and recovered with RMS %.2f px",
+                        bundle->frame_id.c_str(), estimate.rejected_tag_id,
+                        estimate.reprojection_error);
                 }
 
                 geometry_msgs::msg::TransformStamped bundle_transform_stamped;
@@ -440,6 +458,8 @@ AprilTagNode::onParameter(const std::vector<rclcpp::Parameter>& parameters)
         IF("covariance.pixel_stddev", covariance_pixel_stddev)
         IF("covariance.scale", covariance_scale)
         IF("covariance.max_condition_number", covariance_max_condition_number)
+        IF("max_reprojection_error", max_reprojection_error)
+        IF("max_tag_reprojection_error", max_tag_reprojection_error)
     }
 
     mutex.unlock();

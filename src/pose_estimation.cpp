@@ -32,6 +32,7 @@ namespace
 
     PoseEstimate pnpFromPointsWithCovariance(const std::vector<cv::Point3d>& object_points,
                                              const std::vector<cv::Point2d>& image_points,
+                                             const std::vector<int>& point_tag_ids,
                                              const std::array<double, 4>& intr,
                                              const double pixel_stddev,
                                              const double covariance_scale,
@@ -66,6 +67,28 @@ namespace
             for(int parameter = 0; parameter < 6; ++parameter) {
                 jacobian(2 * point, parameter) = projection_jacobian.at<double>(2 * point, parameter);
                 jacobian(2 * point + 1, parameter) = projection_jacobian.at<double>(2 * point + 1, parameter);
+            }
+        }
+
+        double squared_reprojection_error = 0.0;
+        std::unordered_map<int, double> tag_squared_errors;
+        std::unordered_map<int, size_t> tag_point_counts;
+        for(size_t point = 0; point < image_points.size(); ++point) {
+            const double dx = residual(2 * point);
+            const double dy = residual(2 * point + 1);
+            const double squared_error = dx * dx + dy * dy;
+            squared_reprojection_error += squared_error;
+            tag_squared_errors[point_tag_ids[point]] += squared_error;
+            ++tag_point_counts[point_tag_ids[point]];
+        }
+        estimate.reprojection_error = std::sqrt(
+            squared_reprojection_error / static_cast<double>(image_points.size()));
+        for(const auto& tag_error : tag_squared_errors) {
+            const double tag_reprojection_error = std::sqrt(
+                tag_error.second / static_cast<double>(tag_point_counts.at(tag_error.first)));
+            if(tag_reprojection_error > estimate.worst_tag_reprojection_error) {
+                estimate.worst_tag_reprojection_error = tag_reprojection_error;
+                estimate.worst_tag_id = tag_error.first;
             }
         }
 
@@ -181,36 +204,79 @@ pnp_bundle(std::vector<apriltag_detection_t*> detections,
            const std::unordered_map<int, std::vector<double>>& transforms,
            const double pixel_stddev,
            const double covariance_scale,
-           const double max_condition_number)
+           const double max_condition_number,
+           const double max_reprojection_error,
+           const double max_tag_reprojection_error)
 {
-    std::vector<cv::Point3d> objectPoints;
-    std::vector<cv::Point2d> imagePoints;
+    const auto estimate_detections = [&](const std::vector<apriltag_detection_t*>& selected_detections) {
+        std::vector<cv::Point3d> objectPoints;
+        std::vector<cv::Point2d> imagePoints;
+        std::vector<int> pointTagIds;
 
-    for(const apriltag_detection_t* detection : detections) {
-        int id = detection->id;
-        double s = tagsizes.at(id) / 2;
-        const std::vector<double>& tf = transforms.at(detection->id);
+        for(const apriltag_detection_t* detection : selected_detections) {
+            int id = detection->id;
+            double s = tagsizes.at(id) / 2;
+            const std::vector<double>& tf = transforms.at(detection->id);
 
-        // note: The tag bundles should probably store pre-computed bundle-frame tag points rather than recalculating it every detection
-        std::vector<Eigen::Vector3d> corners = {
-            Eigen::Vector3d(-s, -s, 0),
-            Eigen::Vector3d(+s, -s, 0),
-            Eigen::Vector3d(+s, +s, 0),
-            Eigen::Vector3d(-s, +s, 0)};
+            // note: The tag bundles should probably store pre-computed bundle-frame tag points rather than recalculating it every detection
+            std::vector<Eigen::Vector3d> corners = {
+                Eigen::Vector3d(-s, -s, 0),
+                Eigen::Vector3d(+s, -s, 0),
+                Eigen::Vector3d(+s, +s, 0),
+                Eigen::Vector3d(-s, +s, 0)};
 
-        Eigen::Affine3d transform = Eigen::Translation3d(tf[0], tf[1], tf[2]) * Eigen::Quaterniond(tf[3], tf[4], tf[5], tf[6]);
+            Eigen::Affine3d transform = Eigen::Translation3d(tf[0], tf[1], tf[2]) * Eigen::Quaterniond(tf[3], tf[4], tf[5], tf[6]);
 
-        for(const Eigen::Vector3d& point : corners) {
-            Eigen::Vector3d transformed_point = transform * point;
-            objectPoints.push_back(cv::Point3d(transformed_point.x(), transformed_point.y(), transformed_point.z()));
+            for(const Eigen::Vector3d& point : corners) {
+                Eigen::Vector3d transformed_point = transform * point;
+                objectPoints.push_back(cv::Point3d(transformed_point.x(), transformed_point.y(), transformed_point.z()));
+                pointTagIds.push_back(id);
+            }
+            // Add image points
+            for(int i = 0; i < 4; i++) {
+                imagePoints.push_back({detection->p[i][0], detection->p[i][1]});
+            }
         }
-        // Add image points
-        for(int i = 0; i < 4; i++) {
-            imagePoints.push_back({detection->p[i][0], detection->p[i][1]});
+
+        return pnpFromPointsWithCovariance(
+            objectPoints, imagePoints, pointTagIds, intr, pixel_stddev, covariance_scale,
+            max_condition_number);
+    };
+
+    PoseEstimate estimate = estimate_detections(detections);
+    if(!estimate.valid) {
+        return estimate;
+    }
+
+    // A newly visible, bad, or slightly mis-surveyed tag should not poison an
+    // otherwise consistent bundle. Retry at most once without the tag whose
+    // corners have the largest RMS reprojection error. Keep at least two tags
+    // in the solve so normal single- and two-tag behavior is unchanged.
+    if(max_tag_reprojection_error > 0.0 && detections.size() >= 3 &&
+       estimate.worst_tag_reprojection_error > max_tag_reprojection_error) {
+        std::vector<apriltag_detection_t*> filtered_detections;
+        filtered_detections.reserve(detections.size() - 1);
+        for(apriltag_detection_t* detection : detections) {
+            if(detection->id != estimate.worst_tag_id) {
+                filtered_detections.push_back(detection);
+            }
+        }
+
+        PoseEstimate filtered_estimate = estimate_detections(filtered_detections);
+        if(filtered_estimate.valid &&
+           filtered_estimate.reprojection_error < estimate.reprojection_error) {
+            filtered_estimate.rejected_tag_id = estimate.worst_tag_id;
+            estimate = filtered_estimate;
         }
     }
 
-    return pnpFromPointsWithCovariance(objectPoints, imagePoints, intr, pixel_stddev, covariance_scale, max_condition_number);
+    if(max_reprojection_error > 0.0 &&
+       estimate.reprojection_error > max_reprojection_error) {
+        estimate.valid = false;
+        estimate.covariance_valid = false;
+    }
+
+    return estimate;
 }
 const std::unordered_map<std::string, pose_estimation_f> pose_estimation_methods{
     {"homography", homography},

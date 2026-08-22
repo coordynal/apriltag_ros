@@ -13,6 +13,10 @@ struct PoseEstimate
 {
     geometry_msgs::msg::Transform transform;
     std::array<double, 36> covariance{};
+    double reprojection_error = 0.0;
+    double worst_tag_reprojection_error = 0.0;
+    int worst_tag_id = -1;
+    int rejected_tag_id = -1;
     bool valid = false;
     bool covariance_valid = false;
 };
@@ -25,4 +29,6 @@ PoseEstimate pnp_bundle(std::vector<apriltag_detection_t*> detections,
                         const std::unordered_map<int, std::vector<double>>& transforms,
                         double pixel_stddev,
                         double covariance_scale,
-                        double max_condition_number);
+                        double max_condition_number,
+                        double max_reprojection_error,
+                        double max_tag_reprojection_error);
